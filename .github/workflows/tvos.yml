@@ -49,7 +49,8 @@ jobs:
         run: |
           set -euo pipefail
           xcodebuild test -project SignalProbe.xcodeproj -scheme SignalProbe -configuration Debug -destination "id=$SIMULATOR_ID" -derivedDataPath build/simulator -resultBundlePath evidence/Tests.xcresult -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- 2>&1 | tee evidence/simulator-tests.log
-          xcrun simctl io "$SIMULATOR_ID" screenshot evidence/simulator.png
+          # Capture the live app inside XCTest, before teardown removes its surfaces.
+          xcrun xcresulttool export attachments --path evidence/Tests.xcresult --output-path evidence/screenshots
       - name: Build unsigned arm64 tvOS device app
         id: device
         if: ${{ !cancelled() }}
@@ -79,6 +80,12 @@ jobs:
           shasum -a 256 evidence/SignalProbe-unsigned.ipa > evidence/SHA256SUMS
           ditto -c -k --keepParent build/simulator/Build/Products/Debug-appletvsimulator/SignalProbe.app evidence/SignalProbe-simulator.zip
           ditto -c -k --keepParent "$APP.dSYM" evidence/SignalProbe-device.dSYM.zip
+      - name: Set up Go for compatibility probe
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: '1.25.0'
+          cache: false
       - name: Check real IPA with pinned atvloadly parser and synthetic profiles
         if: ${{ !cancelled() && steps.package.outcome == 'success' }}
         run: |

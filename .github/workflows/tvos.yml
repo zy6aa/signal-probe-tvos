@@ -1,0 +1,104 @@
+name: tvOS verification
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: tvos-probe
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      ATVLOADLY_SHA: 95d60bc1bc1a14c1b34f6fc894dc7e2e337f7d7f
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Verify toolchain and source
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          {
+            git rev-parse HEAD
+            sw_vers
+            uname -m
+            echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"
+            xcodebuild -version
+            xcodebuild -showsdks
+            xcrun swift --version
+            xcrun simctl list runtimes
+          } 2>&1 | tee evidence/toolchain.log
+          xcodebuild -version | grep -Fx 'Xcode 26.6'
+          xcrun --sdk appletvos --show-sdk-version | tee evidence/device-sdk.txt
+          python3 scripts/generate_project.py
+          git diff --exit-code -- SignalProbe.xcodeproj
+          plutil -lint SignalProbe.xcodeproj/project.pbxproj App/Info.plist
+          python3 -m unittest discover -s scripts -p 'test_*.py' -v 2>&1 | tee evidence/validator-tests.log
+          # No Swift packages, CocoaPods, Carthage, or third-party app dependencies.
+          xcodebuild -resolvePackageDependencies -project SignalProbe.xcodeproj -scheme SignalProbe 2>&1 | tee evidence/dependencies.log
+          xcrun simctl list devices available --json > evidence/simulators.json
+          python3 scripts/select_simulator.py >> "$GITHUB_ENV"
+      - name: Build tvOS Simulator
+        run: |
+          set -euo pipefail
+          xcodebuild build -project SignalProbe.xcodeproj -scheme SignalProbe -configuration Debug -sdk appletvsimulator -destination "id=$SIMULATOR_ID" -derivedDataPath build/simulator CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- 2>&1 | tee evidence/simulator-build.log
+      - name: Run tvOS playback and remote tests
+        run: |
+          set -euo pipefail
+          xcodebuild test -project SignalProbe.xcodeproj -scheme SignalProbe -configuration Debug -destination "id=$SIMULATOR_ID" -derivedDataPath build/simulator -resultBundlePath evidence/Tests.xcresult -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- 2>&1 | tee evidence/simulator-tests.log
+          xcrun simctl io "$SIMULATOR_ID" screenshot evidence/simulator.png
+      - name: Build unsigned arm64 tvOS device app
+        id: device
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          xcodebuild build -project SignalProbe.xcodeproj -scheme SignalProbe -configuration Release -sdk appletvos -destination 'generic/platform=tvOS' -derivedDataPath build/device ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= 2>&1 | tee evidence/device-build.log
+      - name: Package and validate unsigned IPA
+        if: ${{ !cancelled() && steps.device.outcome == 'success' }}
+        id: package
+        run: |
+          set -euo pipefail
+          python3 scripts/package_ipa.py
+          python3 scripts/validate_ipa.py evidence/SignalProbe-unsigned.ipa | tee evidence/ipa-validation.json
+          APP=build/device/Build/Products/Release-appletvos/SignalProbe.app
+          {
+            file "$APP/SignalProbe"
+            xcrun lipo -archs "$APP/SignalProbe"
+            xcrun vtool -show-build "$APP/SignalProbe"
+            xcrun otool -L "$APP/SignalProbe"
+            plutil -p "$APP/Info.plist"
+            find "$APP" -type f | sort
+          } 2>&1 | tee evidence/device-inspection.log
+          if codesign -dvv "$APP" > evidence/codesign.log 2>&1; then
+            echo 'Unexpected signature' >&2; exit 1
+          fi
+          grep -F 'not signed at all' evidence/codesign.log
+          shasum -a 256 evidence/SignalProbe-unsigned.ipa > evidence/SHA256SUMS
+          ditto -c -k --keepParent build/simulator/Build/Products/Debug-appletvsimulator/SignalProbe.app evidence/SignalProbe-simulator.zip
+          ditto -c -k --keepParent "$APP.dSYM" evidence/SignalProbe-device.dSYM.zip
+      - name: Check real IPA with pinned atvloadly parser and synthetic profiles
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          git init build/atvloadly
+          git -C build/atvloadly remote add origin https://github.com/bitxeno/atvloadly.git
+          git -C build/atvloadly fetch --depth 1 origin "$ATVLOADLY_SHA"
+          git -C build/atvloadly checkout --detach FETCH_HEAD
+          test "$(git -C build/atvloadly rev-parse HEAD)" = "$ATVLOADLY_SHA"
+          mkdir -p build/atvloadly/cmd/pipelineprobe
+          cp scripts/atvloadly_probe.go build/atvloadly/cmd/pipelineprobe/main.go
+          IPA="$PWD/evidence/SignalProbe-unsigned.ipa"
+          cd build/atvloadly
+          go version
+          go run ./cmd/pipelineprobe "$IPA" 2> ../../evidence/atvloadly-stderr.log | tee ../../evidence/atvloadly-compatibility.json
+      - name: Upload build evidence (unsigned; not an installable release)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tvos-evidence-${{ github.sha }}
+          path: evidence/
+          retention-days: 3
+          if-no-files-found: error
